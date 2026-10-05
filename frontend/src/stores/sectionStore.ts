@@ -9,7 +9,8 @@ import type { Section } from '@/types/section'
 import { createEmptySectionFilter, type SectionFilterState } from '@/types/section'
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
-import type { Point } from '@/types/point'
+import type { Point, PointStatus } from '@/types/point'
+import { findEffectiveLine, convertVelocity, type CalibrationLine } from '@/types/calibration'
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -27,6 +28,8 @@ export interface PointDraft {
   velocityMs: number
   weight: number
   durationS: number
+  /** 转数（流速仪法原始读数）；浮标 / ADCP 法为 null */
+  revolutions: number | null
 }
 
 export function createEmptyVerticalDraft(nextNo = 1): VerticalDraft {
@@ -34,7 +37,42 @@ export function createEmptyVerticalDraft(nextNo = 1): VerticalDraft {
 }
 
 export function createEmptyPointDraft(): PointDraft {
-  return { relativeDepth: 0.6, velocityMs: 0.5, weight: 1, durationS: 100 }
+  return { relativeDepth: 0.6, velocityMs: 0.5, weight: 1, durationS: 100, revolutions: null }
+}
+
+/**
+ * 由测次与测点草稿解析流速、检定线归属与状态：
+ * - 浮标 / ADCP：流速直接测得，无转数与检定线归属，置正常；
+ * - 流速仪：按「仪号 + 施测日」找生效线；命中且有转数则换算流速并置正常，
+ *   命中但未填转数则暂挂（待补转数），对不上线则挂起。
+ */
+function resolvePointFields(
+  section: Section | null,
+  draft: { velocityMs: number; durationS: number; revolutions: number | null },
+  lines: CalibrationLine[]
+): { velocityMs: number; calibrationId: string | null; status: PointStatus } {
+  const isMeter = section?.method === '流速仪'
+  if (!isMeter) {
+    return { velocityMs: draft.velocityMs, calibrationId: null, status: 'active' }
+  }
+  const line = findEffectiveLine(lines, section?.meterNo, section?.measuredAt)
+  if (!line) {
+    return { velocityMs: draft.velocityMs, calibrationId: null, status: 'suspended' }
+  }
+  if (draft.revolutions !== null && Number.isFinite(draft.revolutions)) {
+    return {
+      velocityMs: convertVelocity(draft.revolutions, draft.durationS, line),
+      calibrationId: line.id,
+      status: 'active'
+    }
+  }
+  // 流速仪法但未填转数：记下线归属并暂挂，待补转数后换算
+  return { velocityMs: draft.velocityMs, calibrationId: line.id, status: 'suspended' }
+}
+
+/** 批量生成测点行时的默认状态：流速仪测次无线归属先挂起，浮标 / ADCP 直接正常 */
+function defaultPointStatus(section: Section | null): PointStatus {
+  return section?.method === '流速仪' ? 'suspended' : 'active'
 }
 
 export const useSectionStore = defineStore('section', () => {
@@ -211,7 +249,8 @@ export const useSectionStore = defineStore('section', () => {
     const now = Date.now()
     const row: Vertical = { ...payload, sectionId, id: createId('vrt'), createdAt: now, updatedAt: now }
     await db.verticals.put(row)
-    // 录入测深后按相对水深自动生成测点行
+    // 录入测深后按相对水深自动生成测点行（流速仪测次暂挂，待补转数换算）
+    const section = sectionById(sectionId)
     const depths = buildRelativeDepths(payload.pointCount)
     const pointRows: Point[] = depths.map((relativeDepth, index) => ({
       id: createId('pnt'),
@@ -220,6 +259,9 @@ export const useSectionStore = defineStore('section', () => {
       velocityMs: 0.5,
       weight: Number((1 / depths.length).toFixed(4)),
       durationS: 100,
+      revolutions: null,
+      calibrationId: null,
+      status: defaultPointStatus(section),
       createdAt: now + index,
       updatedAt: now + index
     }))
@@ -238,9 +280,11 @@ export const useSectionStore = defineStore('section', () => {
     })
   }
 
-  /** 按测点数重排该垂线的测点行（保持已有流速值，缺失的补默认） */
+  /** 按测点数重排该垂线的测点行（保持已有流速值与归属，缺失的补默认） */
   async function regeneratePoints(verticalId: string, pointCount: number): Promise<number> {
     const existing = pointsOfVertical(verticalId)
+    const vertical = verticals.value.find((item) => item.id === verticalId) ?? null
+    const section = vertical ? sectionById(vertical.sectionId) : null
     const depths = buildRelativeDepths(pointCount)
     const now = Date.now()
     const rows: Point[] = depths.map((relativeDepth, index) => {
@@ -252,6 +296,9 @@ export const useSectionStore = defineStore('section', () => {
         velocityMs: match?.velocityMs ?? 0.5,
         weight: Number((1 / depths.length).toFixed(4)),
         durationS: match?.durationS ?? 100,
+        revolutions: match?.revolutions ?? null,
+        calibrationId: match?.calibrationId ?? null,
+        status: match?.status ?? defaultPointStatus(section),
         createdAt: match?.createdAt ?? now + index,
         updatedAt: now + index
       }
@@ -271,14 +318,36 @@ export const useSectionStore = defineStore('section', () => {
     payload: Omit<Point, 'id' | 'createdAt' | 'updatedAt' | 'verticalId'>
   ): Promise<Point> {
     const now = Date.now()
-    const row: Point = { ...payload, verticalId, id: createId('pnt'), createdAt: now, updatedAt: now }
+    const vertical = verticals.value.find((item) => item.id === verticalId) ?? null
+    const section = vertical ? sectionById(vertical.sectionId) : null
+    const lines = await db.calibrations.toArray()
+    // 按测次仪号 + 施测日解析检定线归属与流速（覆盖表单传入的占位归属）
+    const resolved = resolvePointFields(section, payload, lines)
+    const row: Point = {
+      ...payload,
+      ...resolved,
+      verticalId,
+      id: createId('pnt'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.points.put(row)
     await syncVerticalPointCount(verticalId)
     return row
   }
 
   async function updatePoint(id: string, patch: Partial<Point>): Promise<void> {
-    await db.points.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const existing = points.value.find((item) => item.id === id)
+    if (existing) {
+      const vertical = verticals.value.find((item) => item.id === existing.verticalId) ?? null
+      const section = vertical ? sectionById(vertical.sectionId) : null
+      const lines = await db.calibrations.toArray()
+      const merged = { ...existing, ...patch }
+      const resolved = resolvePointFields(section, merged, lines)
+      await db.points.update(id, { ...patch, ...resolved, updatedAt: Date.now() } as never)
+    } else {
+      await db.points.update(id, { ...patch, updatedAt: Date.now() } as never)
+    }
   }
 
   async function removePoint(id: string): Promise<void> {
@@ -287,7 +356,7 @@ export const useSectionStore = defineStore('section', () => {
     if (point) await syncVerticalPointCount(point.verticalId)
   }
 
-  /** 批量改写某垂线全部测点流速（批量录入） */
+  /** 批量改写某垂线全部测点流速（批量录入，视为人工直读流速，置正常） */
   async function bulkSetVelocity(verticalId: string, velocityMs: number): Promise<number> {
     const now = Date.now()
     await db.points
@@ -295,6 +364,7 @@ export const useSectionStore = defineStore('section', () => {
       .equals(verticalId)
       .modify((point) => {
         point.velocityMs = velocityMs
+        point.status = 'active'
         point.updatedAt = now
       })
     return pointsOfVertical(verticalId).length
@@ -306,6 +376,8 @@ export const useSectionStore = defineStore('section', () => {
     rows: Array<{ relativeDepth: number; velocityMs: number; durationS: number }>
   ): Promise<number> {
     const now = Date.now()
+    const vertical = verticals.value.find((item) => item.id === verticalId) ?? null
+    const section = vertical ? sectionById(vertical.sectionId) : null
     const records: Point[] = rows.map((row, index) => ({
       id: createId('pnt'),
       verticalId,
@@ -313,6 +385,9 @@ export const useSectionStore = defineStore('section', () => {
       velocityMs: row.velocityMs,
       weight: Number((1 / rows.length).toFixed(4)),
       durationS: row.durationS,
+      revolutions: null,
+      calibrationId: null,
+      status: defaultPointStatus(section),
       createdAt: now + index,
       updatedAt: now + index
     }))

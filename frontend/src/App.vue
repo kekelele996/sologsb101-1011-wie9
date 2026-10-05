@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { DataLine, Files, Histogram, Medal, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useCalibrationStore } from '@/stores/calibrationStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const calibrationStore = useCalibrationStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  calibrationStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -34,6 +37,12 @@ const activeKey = computed(() => {
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
   { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
+  {
+    key: '/calibrations',
+    label: '流速仪检定线',
+    icon: Medal,
+    badge: calibrationStore.suspendedCount > 0 ? String(calibrationStore.suspendedCount) : String(calibrationStore.lines.length)
+  },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
 
@@ -115,7 +124,8 @@ function go(path: string): void {
       </span>
       <span>
         测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
-        {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
+        {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }}（挂起
+        {{ calibrationStore.suspendedCount }}）· 检定线 {{ calibrationStore.lines.length }} · 点据
         {{ ratingStore.ratings.length }}
       </span>
     </footer>

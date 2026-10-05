@@ -7,26 +7,37 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, DocumentCopy, Edit, MagicStick, Plus, TrendCharts } from '@element-plus/icons-vue'
+import { Delete, DocumentCopy, Edit, MagicStick, Plus, TrendCharts, Warning } from '@element-plus/icons-vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useCalibrationStore } from '@/stores/calibrationStore'
 import { parsePointPaste } from '@/types/point'
 import type { Point } from '@/types/point'
-import { calcMeanVelocity, calcSectionDischarge, velocityFromRevolutions } from '@/utils/flow'
+import { convertVelocity, POINT_STATUS_META } from '@/types/calibration'
+import { calcMeanVelocity, calcSectionDischarge, activePointRows } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const calibrationStore = useCalibrationStore()
 
 const verticalId = computed(() => String(route.params.id ?? ''))
 const vertical = computed(() => sectionStore.verticals.find((item) => item.id === verticalId.value) ?? null)
 const section = computed(() => (vertical.value ? sectionStore.sectionById(vertical.value.sectionId) : null))
 const station = computed(() => (section.value ? stationStore.stationById(section.value.stationId) : null))
+
+/** 本测次施测日生效的检定线（流速仪法） */
+const effectiveLine = computed(() =>
+  section.value && section.value.method === '流速仪'
+    ? calibrationStore.effectiveLine(section.value.meterNo, section.value.measuredAt)
+    : null
+)
+const isMeterMethod = computed(() => section.value?.method === '流速仪')
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -35,7 +46,8 @@ const form = reactive({
   relativeDepth: 0.6,
   velocityMs: 0.5,
   weight: 1,
-  durationS: 100
+  durationS: 100,
+  revolutions: null as number | null
 })
 
 const pasteVisible = ref(false)
@@ -45,11 +57,18 @@ const pasteErrors = ref<string[]>([])
 const bulkVelocity = ref<number | null>(null)
 
 const points = computed(() => sectionStore.pointsOfVertical(verticalId.value))
-const meanVelocityMs = computed(() =>
-  calcMeanVelocity(points.value.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
-)
+/** 挂起测点不参与垂线平均流速 */
+const activePoints = computed(() => points.value.filter((point) => point.status !== 'suspended'))
+const meanVelocityMs = computed(() => calcMeanVelocity(activePointRows(points.value)))
+const suspendedCount = computed(() => points.value.filter((point) => point.status === 'suspended').length)
 
-/** 该垂线所在断面的流量成果（用于对比本垂线贡献） */
+/** 由转数按生效检定线换算的流速（流速仪法） */
+const convertedVelocity = computed(() => {
+  if (!effectiveLine.value || form.revolutions === null || !Number.isFinite(form.revolutions)) return null
+  return convertVelocity(form.revolutions, form.durationS, effectiveLine.value)
+})
+
+/** 该垂线所在断面的流量成果（挂起测点不参与） */
 const discharge = computed(() => {
   if (!section.value) return null
   const rows = sectionStore.verticalsOfSection(section.value.id).map((item) => {
@@ -59,7 +78,7 @@ const discharge = computed(() => {
       no: item.no,
       startDistanceM: item.startDistanceM,
       depthM: item.depthM,
-      meanVelocityMs: calcMeanVelocity(itemPoints.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
+      meanVelocityMs: calcMeanVelocity(activePointRows(itemPoints))
     }
   })
   return calcSectionDischarge(rows)
@@ -72,12 +91,13 @@ const verticalPartialFlow = computed(() => {
   return slice ? slice.partialFlow : 0
 })
 
-/** 流速分布图坐标：相对水深为纵轴、流速为横轴 */
+/** 流速分布图坐标：相对水深为纵轴、流速为横轴（挂起点不参与） */
 const chartPoints = computed(() => {
-  const maxVelocity = Math.max(0.1, ...points.value.map((point) => point.velocityMs))
+  const rows = activePoints.value
+  const maxVelocity = Math.max(0.1, ...rows.map((point) => point.velocityMs))
   const width = 320
   const height = 200
-  return points.value.map((point) => ({
+  return rows.map((point) => ({
     ...point,
     cx: 40 + (point.velocityMs / maxVelocity) * (width - 60),
     cy: 20 + point.relativeDepth * (height - 50)
@@ -92,6 +112,7 @@ function openCreate(): void {
   form.velocityMs = points.value.length > 0 ? points.value[0].velocityMs : 0.5
   form.weight = Number((1 / Math.max(1, points.value.length + 1)).toFixed(4))
   form.durationS = 100
+  form.revolutions = null
   dialogVisible.value = true
 }
 
@@ -101,6 +122,7 @@ function openEdit(point: Point): void {
   form.velocityMs = point.velocityMs
   form.weight = point.weight
   form.durationS = point.durationS
+  form.revolutions = point.revolutions
   dialogVisible.value = true
 }
 
@@ -117,13 +139,22 @@ async function submitForm(): Promise<void> {
     ElMessage.warning('测速历时应为正数（s）')
     return
   }
+  if (isMeterMethod.value && (form.revolutions === null || !Number.isFinite(form.revolutions))) {
+    ElMessage.warning('流速仪法请填写转数，流速按施测日生效检定线换算')
+    return
+  }
   submitting.value = true
   try {
+    // 流速仪法：流速由转数按生效线换算，覆盖表单手填值
+    const payload = { ...form, calibrationId: null, status: 'active' as const }
+    if (isMeterMethod.value && effectiveLine.value && form.revolutions !== null) {
+      payload.velocityMs = convertVelocity(form.revolutions, form.durationS, effectiveLine.value)
+    }
     if (editingId.value) {
-      await sectionStore.updatePoint(editingId.value, { ...form })
+      await sectionStore.updatePoint(editingId.value, { ...payload })
       ElMessage.success('测点已更新')
     } else {
-      await sectionStore.createPoint(verticalId.value, { ...form })
+      await sectionStore.createPoint(verticalId.value, { ...payload })
       ElMessage.success('测点已新增')
     }
     dialogVisible.value = false
@@ -205,17 +236,15 @@ async function doNormalize(): Promise<void> {
   ElMessage.success(`已按 ${count} 个测点平均分配计算权重`)
 }
 
-/** 由转数推算流速（流速仪公式），填回表单 */
-function fillByRevolutions(): void {
-  const revolutions = Number(window.prompt('请输入测速历时内的转数（转）：', '120'))
-  if (!Number.isFinite(revolutions) || revolutions <= 0) return
-  form.velocityMs = velocityFromRevolutions(revolutions, form.durationS)
-  ElMessage.success(`按转数 ${revolutions}、历时 ${form.durationS}s 推算流速 ${form.velocityMs} m/s`)
+/** 挂起行高亮 */
+function rowClassName({ row }: { row: Point }): string {
+  return row.status === 'suspended' ? 'gb-row-suspended' : ''
 }
 
 onMounted(() => {
   if (stationStore.stations.length === 0) void initDatabase()
   sectionStore.selectVertical(verticalId.value)
+  calibrationStore.start()
 })
 </script>
 
@@ -259,7 +288,7 @@ onMounted(() => {
             <el-tag size="small" type="info" effect="plain">水深 {{ vertical.depthM.toFixed(2) }} m</el-tag>
           </h2>
           <p class="gb-hint">
-            逐点录入相对水深与流速，权重参与加权平均；同一垂线的平均流速乘以部分面积得到部分流量，最终汇总为断面流量。
+            逐点录入相对水深与转数，流速按施测日生效检定线换算；挂起测点不参与垂线平均流速与断面流量。
           </p>
         </div>
         <div class="page__actions">
@@ -268,6 +297,28 @@ onMounted(() => {
           <el-button type="primary" :icon="Plus" @click="openCreate">新增测点</el-button>
         </div>
       </div>
+
+      <el-alert
+        v-if="isMeterMethod"
+        class="page__line-bar"
+        :type="effectiveLine ? 'success' : 'warning'"
+        :closable="false"
+        show-icon
+      >
+        <template #title>
+          <template v-if="effectiveLine">
+            本测次施测日（{{ section?.measuredAt.slice(0, 10) }}）生效检定线：
+            <span class="gb-mono">{{ effectiveLine.certNo }}</span>
+            （{{ effectiveLine.meterNo }}，{{ effectiveLine.effectiveFrom.slice(0, 10) }} ~
+            {{ effectiveLine.effectiveTo ? effectiveLine.effectiveTo.slice(0, 10) : '长期' }}），
+            系数 k={{ effectiveLine.k }}、c={{ effectiveLine.c }}，流速 v = k·转数/历时 + c。
+          </template>
+          <template v-else>
+            本测次（{{ section?.meterNo || '未填流速仪编号' }}）在施测日没有生效的检定线，
+            测点将挂起、不参与断面流量；请先到「流速仪检定线」核对或补录，再由巡测组重算。
+          </template>
+        </template>
+      </el-alert>
 
       <div class="gb-stats-row">
         <StatBadge label="测点数" :value="points.length" suffix="点" icon="DataLine" />
@@ -280,6 +331,14 @@ onMounted(() => {
           tone="warning"
           icon="Odometer"
         />
+        <StatBadge
+          v-if="suspendedCount > 0"
+          label="挂起测点"
+          :value="suspendedCount"
+          suffix="点"
+          tone="warning"
+          icon="Warning"
+        />
       </div>
 
       <el-card shadow="never" class="gb-panel">
@@ -291,7 +350,6 @@ onMounted(() => {
           <el-input-number v-model="bulkVelocity" :min="0" :max="12" :step="0.01" :precision="3" :controls="false" placeholder="统一流速 m/s" class="page__bulk-input" />
           <el-button @click="applyBulkVelocity">批量改写流速</el-button>
           <el-button :icon="DocumentCopy" @click="openPaste">批量粘贴导入</el-button>
-          <el-button :icon="MagicStick" @click="fillByRevolutions">按转数推算</el-button>
         </div>
       </el-card>
 
@@ -306,28 +364,47 @@ onMounted(() => {
       />
 
       <div v-else class="page__grid">
-        <el-table :data="points" border stripe class="gb-table-compact">
-          <el-table-column label="相对水深" width="110" align="right">
+        <el-table :data="points" border stripe class="gb-table-compact" :row-class-name="rowClassName">
+          <el-table-column label="相对水深" width="100" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.relativeDepth.toFixed(2) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="测点流速 (m/s)" width="140" align="right">
+          <el-table-column label="转数" width="90" align="right">
+            <template #default="{ row }">
+              <span v-if="row.revolutions !== null" class="gb-mono">{{ row.revolutions }}</span>
+              <span v-else class="gb-mono page__muted">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="测点流速 (m/s)" width="130" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.velocityMs.toFixed(3) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="计算权重" width="110" align="right">
+          <el-table-column label="计算权重" width="100" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.weight.toFixed(4) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="测速历时 (s)" width="120" align="right">
+          <el-table-column label="测速历时 (s)" width="110" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.durationS }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="加权贡献" align="right" min-width="120">
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <el-tag
+                v-if="row.status === 'suspended'"
+                :type="POINT_STATUS_META.suspended.type"
+                size="small"
+                effect="light"
+              >
+                挂起
+              </el-tag>
+              <el-tag v-else :type="POINT_STATUS_META.active.type" size="small" effect="plain">正常</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="加权贡献" align="right" min-width="110">
             <template #default="{ row }">
               <span class="gb-mono">{{ (row.velocityMs * row.weight).toFixed(4) }}</span>
             </template>
@@ -377,9 +454,25 @@ onMounted(() => {
           <el-slider v-model="form.relativeDepth" :min="0" :max="1" :step="0.05" show-input />
           <span class="page__unit">0 水面 · 1 河底</span>
         </el-form-item>
+        <el-form-item v-if="isMeterMethod" label="转数" required>
+          <el-input-number v-model="form.revolutions" :min="0" :step="1" :precision="0" controls-position="right" placeholder="测速历时内转数" />
+          <span class="page__unit">转</span>
+        </el-form-item>
         <el-form-item label="测点流速" required>
-          <el-input-number v-model="form.velocityMs" :min="0" :max="12" :step="0.01" :precision="3" controls-position="right" />
+          <el-input-number
+            v-model="form.velocityMs"
+            :min="0"
+            :max="12"
+            :step="0.01"
+            :precision="3"
+            controls-position="right"
+            :readonly="isMeterMethod && !!effectiveLine"
+          />
           <span class="page__unit">m/s</span>
+          <span v-if="isMeterMethod && effectiveLine" class="page__convert">
+            按 {{ effectiveLine.certNo }} 换算：
+            <span class="gb-mono">{{ convertedVelocity !== null ? convertedVelocity.toFixed(3) : '—' }}</span> m/s
+          </span>
         </el-form-item>
         <el-form-item label="计算权重" required>
           <el-input-number v-model="form.weight" :min="0" :max="1" :step="0.01" :precision="4" controls-position="right" />
@@ -479,6 +572,25 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__line-bar {
+  margin: 0;
+}
+
+.page__muted {
+  color: #b0bec5;
+}
+
+.page__convert {
+  margin-left: 12px;
+  font-size: 12px;
+  color: #0f4c75;
+}
+
+:deep(.gb-row-suspended) {
+  background: #fdf6ec !important;
+  color: #b88230;
 }
 
 .page__errors {

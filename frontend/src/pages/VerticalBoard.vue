@@ -14,7 +14,7 @@ import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { buildRelativeDepths, type Vertical } from '@/types/vertical'
-import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
+import { calcMeanVelocity, calcSectionDischarge, activePointRows } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -44,7 +44,7 @@ const conflicts = computed(() => (section.value ? sectionStore.findDistanceConfl
 const verticalRows = computed(() =>
   verticals.value.map((vertical) => {
     const points = sectionStore.pointsOfVertical(vertical.id)
-    const meanVelocityMs = calcMeanVelocity(points.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
+    const meanVelocityMs = calcMeanVelocity(activePointRows(points))
     return { vertical, points, meanVelocityMs }
   })
 )

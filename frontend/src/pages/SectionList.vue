@@ -33,6 +33,7 @@ const form = reactive({
   startDistanceM: 0,
   stageM: 0,
   method: '流速仪' as MeasureMethod,
+  meterNo: '',
   measuredAt: new Date().toISOString().slice(0, 16)
 })
 
@@ -81,6 +82,7 @@ function openCreate(): void {
   form.startDistanceM = stats.value.latest?.startDistanceM ?? 0
   form.stageM = stats.value.latest?.stageM ?? 0
   form.method = '流速仪'
+  form.meterNo = ''
   form.measuredAt = new Date().toISOString().slice(0, 16)
   dialogVisible.value = true
 }
@@ -91,6 +93,7 @@ function openEdit(section: Section): void {
   form.startDistanceM = section.startDistanceM
   form.stageM = section.stageM
   form.method = section.method
+  form.meterNo = section.meterNo ?? ''
   form.measuredAt = section.measuredAt.slice(0, 16)
   dialogVisible.value = true
 }
@@ -120,6 +123,7 @@ async function submitForm(): Promise<void> {
       startDistanceM: form.startDistanceM,
       stageM: form.stageM,
       method: form.method,
+      meterNo: form.method === '流速仪' ? form.meterNo.trim() : '',
       measuredAt: new Date(form.measuredAt).toISOString()
     }
     if (editingId.value) {
@@ -330,6 +334,9 @@ onMounted(() => {
           <el-radio-group v-model="form.method">
             <el-radio-button v-for="method in MEASURE_METHODS" :key="method" :value="method">{{ method }}</el-radio-button>
           </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="form.method === '流速仪'" label="流速仪编号">
+          <el-input v-model="form.meterNo" placeholder="如 LS25-1/08#，测点按施测日生效检定线换算" maxlength="32" />
         </el-form-item>
         <el-form-item label="水位" required>
           <el-input-number v-model="form.stageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" />

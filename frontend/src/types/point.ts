@@ -1,3 +1,6 @@
+/** 测点状态：正常参与流量 / 挂起（无有效检定线或线已撤销，不参与断面流量） */
+export type PointStatus = 'active' | 'suspended'
+
 /** 流速测点：垂线上按相对水深布设的测速点 */
 export interface Point {
   id: string
@@ -5,12 +8,22 @@ export interface Point {
   verticalId: string
   /** 相对水深：0 为水面、1 为河底 */
   relativeDepth: number
-  /** 测点流速（m/s） */
+  /**
+   * 测点流速（m/s）。
+   * 流速仪法下由「转数 + 施测日生效检定线系数」换算而来；
+   * 浮标 / ADCP 法为直接测得，无转数与检定线归属。
+   */
   velocityMs: number
-  /** 计算权重（垂直流速分布加权系数） */
-  weight: number
   /** 测速历时（s） */
   durationS: number
+  /** 转数（转）：流速仪法原始读数；浮标 / ADCP 法为 null */
+  revolutions: number | null
+  /** 换算所依据的检定线 id（流速仪法）；浮标 / ADCP 法或对不上时为 null */
+  calibrationId: string | null
+  /** 正常 / 挂起：挂起点不参与垂线平均流速与断面流量 */
+  status: PointStatus
+  /** 计算权重（垂直流速分布加权系数） */
+  weight: number
   createdAt: number
   updatedAt: number
 }

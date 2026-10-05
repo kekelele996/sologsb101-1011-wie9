@@ -12,12 +12,14 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { CalibrationLine } from '@/types/calibration'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
-import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import { calcMeanVelocity, DEFAULT_WEIGHTS, round, activePointRows } from '@/utils/flow'
+import { attributePoints } from '@/utils/calibration'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +42,7 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  calibrations: CalibrationLine[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +52,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  calibrations!: Table<CalibrationLine, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,20 +68,35 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
+    this.version(2).stores({
+      stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+      sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+      verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+      points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+      ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+      compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+    })
+
+    // v3：新增检定线台账；测点补转数、检定线归属与状态，测次补流速仪编号
     this.version(DB_VERSION)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
-        sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+        sections: 'id, stationId, measureNo, method, meterNo, stageM, measuredAt, updatedAt',
         verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
-        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, calibrationId, status, updatedAt',
         ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
-        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+        calibrations: 'id, meterNo, certNo, status, effectiveFrom, effectiveTo, updatedAt'
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与判定结论，避免列表排序与筛选拿到 undefined
+        // v2 → v3：
+        // 1) 历史数据补齐时间戳与判定结论
+        // 2) 测次补流速仪编号（旧数据无仪号，留空，由用户在页面补选后重算）
+        // 3) 测点补转数 / 归属 / 状态：旧数据只存了流速没归属，按测次时间回填检定线，
+        //    对不上的单列挂起（status='suspended'），不参与断面流量。
         const stamps: Array<[string, () => Record<string, unknown>]> = [
           ['stations', () => ({})],
-          ['sections', () => ({ measuredAt: new Date().toISOString() })],
+          ['sections', () => ({ measuredAt: new Date().toISOString(), meterNo: '' })],
           ['verticals', () => ({ pointCount: 0, bedNote: '' })],
           ['points', () => ({ weight: DEFAULT_WEIGHTS[1], durationS: 100 })],
           ['ratings', () => ({ measureNo: '', lineNo: 'A' })],
@@ -94,6 +113,16 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+
+        // 测点归属回填：按测次时间找生效检定线，对不上的挂起
+        const [points, verticals, sections, lines] = await Promise.all([
+          tx.table('points').toArray(),
+          tx.table('verticals').toArray(),
+          tx.table('sections').toArray(),
+          tx.table('calibrations').toArray()
+        ])
+        const { points: attributed } = attributePoints(points as Point[], verticals as Vertical[], sections as Section[], lines as CalibrationLine[])
+        await tx.table('points').bulkPut(attributed)
       })
   }
 }
@@ -126,7 +155,8 @@ interface SeedStationBundle {
   station: Omit<Station, 'createdAt' | 'updatedAt'>
   sections: Array<Omit<Section, 'createdAt' | 'updatedAt'>>
   verticals: Array<Omit<Vertical, 'createdAt' | 'updatedAt'>>
-  points: Array<Omit<Point, 'createdAt' | 'updatedAt'>>
+  /** 原始测点：无转数与检定线归属，播种后按测次时间回填 */
+  points: Array<Omit<Point, 'createdAt' | 'updatedAt' | 'revolutions' | 'calibrationId' | 'status'>>
 }
 
 /**
@@ -155,6 +185,7 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
+          meterNo: 'LS25-1/08#',
           measuredAt: '2024-06-12T08:30:00.000Z'
         },
         {
@@ -164,14 +195,27 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
+          meterNo: '',
           measuredAt: '2024-07-18T09:10:00.000Z'
+        },
+        {
+          // 对不上检定线的旧测次：施测日早于所有检定线生效起始，测点单列挂起
+          id: 'sec_lh_2203',
+          stationId: 'stn_lh01',
+          measureNo: '2022-03-009',
+          startDistanceM: 11.0,
+          stageM: 4.86,
+          method: '流速仪',
+          meterNo: 'LS25-1/08#',
+          measuredAt: '2022-03-15T08:00:00.000Z'
         }
       ],
       verticals: [
         { id: 'vrt_lh_1', sectionId: 'sec_lh_2406', no: 1, startDistanceM: 6.5, depthM: 1.4, pointCount: 2, bedNote: '左岸浅滩，砾石河床' },
         { id: 'vrt_lh_2', sectionId: 'sec_lh_2406', no: 2, startDistanceM: 14.0, depthM: 3.2, pointCount: 3, bedNote: '主流，砂卵石' },
         { id: 'vrt_lh_3', sectionId: 'sec_lh_2406', no: 3, startDistanceM: 22.0, depthM: 2.1, pointCount: 2, bedNote: '右岸缓流，细砂' },
-        { id: 'vrt_lh_4', sectionId: 'sec_lh_2407', no: 1, startDistanceM: 8.0, depthM: 3.8, pointCount: 3, bedNote: 'ADCP 走航断面，主槽' }
+        { id: 'vrt_lh_4', sectionId: 'sec_lh_2407', no: 1, startDistanceM: 8.0, depthM: 3.8, pointCount: 3, bedNote: 'ADCP 走航断面，主槽' },
+        { id: 'vrt_lh_5', sectionId: 'sec_lh_2203', no: 1, startDistanceM: 10.0, depthM: 2.2, pointCount: 2, bedNote: '旧测次，检定线缺失' }
       ],
       points: [
         { id: 'pnt_lh_11', verticalId: 'vrt_lh_1', relativeDepth: 0.2, velocityMs: 0.62, weight: 0.5, durationS: 100 },
@@ -183,7 +227,9 @@ export async function seedDemoData(): Promise<void> {
         { id: 'pnt_lh_32', verticalId: 'vrt_lh_3', relativeDepth: 0.8, velocityMs: 0.64, weight: 0.5, durationS: 100 },
         { id: 'pnt_lh_41', verticalId: 'vrt_lh_4', relativeDepth: 0.2, velocityMs: 1.86, weight: 1 / 3, durationS: 120 },
         { id: 'pnt_lh_42', verticalId: 'vrt_lh_4', relativeDepth: 0.6, velocityMs: 1.64, weight: 1 / 3, durationS: 120 },
-        { id: 'pnt_lh_43', verticalId: 'vrt_lh_4', relativeDepth: 0.8, velocityMs: 1.32, weight: 1 / 3, durationS: 120 }
+        { id: 'pnt_lh_43', verticalId: 'vrt_lh_4', relativeDepth: 0.8, velocityMs: 1.32, weight: 1 / 3, durationS: 120 },
+        { id: 'pnt_lh_51', verticalId: 'vrt_lh_5', relativeDepth: 0.2, velocityMs: 0.78, weight: 0.5, durationS: 100 },
+        { id: 'pnt_lh_52', verticalId: 'vrt_lh_5', relativeDepth: 0.8, velocityMs: 0.56, weight: 0.5, durationS: 100 }
       ]
     },
     {
@@ -203,6 +249,7 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
+          meterNo: '',
           measuredAt: '2024-05-22T07:50:00.000Z'
         },
         {
@@ -212,6 +259,7 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
+          meterNo: 'LS25-1/12#',
           measuredAt: '2024-08-09T06:40:00.000Z'
         }
       ],
@@ -251,6 +299,7 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
+          meterNo: '',
           measuredAt: '2024-06-20T10:05:00.000Z'
         }
       ],
@@ -287,15 +336,64 @@ export async function seedDemoData(): Promise<void> {
     { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
   ]
 
+  // 检定线台账：08# 表经历一次换新（旧线已被新线替代），12# 表在用，另留一条已撤销线
+  const calibrationSeeds: Array<Omit<CalibrationLine, 'createdAt' | 'updatedAt'>> = [
+    {
+      id: 'cal_lm_old',
+      certNo: '检字 2023-012',
+      meterNo: 'LS25-1/08#',
+      effectiveFrom: '2023-01-01',
+      effectiveTo: '2024-06-30',
+      k: 0.25,
+      c: 0.01,
+      status: 'replaced',
+      remark: '08# 表 2023 年检定，2024-07 起被新线替代'
+    },
+    {
+      id: 'cal_lm_new',
+      certNo: '检字 2024-018',
+      meterNo: 'LS25-1/08#',
+      effectiveFrom: '2024-07-01',
+      effectiveTo: null,
+      k: 0.248,
+      c: 0.012,
+      status: 'active',
+      remark: '08# 表 2024 年检定，当前在用'
+    },
+    {
+      id: 'cal_qj',
+      certNo: '检字 2024-005',
+      meterNo: 'LS25-1/12#',
+      effectiveFrom: '2024-01-01',
+      effectiveTo: null,
+      k: 0.252,
+      c: 0.009,
+      status: 'active',
+      remark: '12# 表 2024 年检定，当前在用'
+    },
+    {
+      id: 'cal_lm_revoked',
+      certNo: '检字 2023-099',
+      meterNo: 'LS25-1/08#',
+      effectiveFrom: '2023-06-01',
+      effectiveTo: '2023-12-31',
+      k: 0.3,
+      c: 0.02,
+      status: 'revoked',
+      remark: '08# 表临时检定线，已撤销作废'
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.calibrations],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
         updatedAt: now + row.id.length
       })
 
+      await db.calibrations.bulkPut(calibrationSeeds.map((line) => ({ ...line, ...stamp(line) })))
       await db.stations.bulkPut(
         stationBundles.map((bundle) => ({ ...bundle.station, ...stamp(bundle.station) }))
       )
@@ -309,11 +407,29 @@ export async function seedDemoData(): Promise<void> {
           bundle.verticals.map((vertical) => ({ ...vertical, ...stamp(vertical) }))
         )
       )
-      await db.points.bulkPut(
-        stationBundles.flatMap((bundle) =>
-          bundle.points.map((point) => ({ ...point, ...stamp(point) }))
-        )
+      // 测点先落原始数据，再按测次时间回填检定线归属（旧数据只存了流速没归属）
+      const rawPoints = stationBundles.flatMap((bundle) =>
+        bundle.points.map((point) => ({
+          ...point,
+          ...stamp(point),
+          revolutions: null,
+          calibrationId: null,
+          status: 'active' as const
+        }))
       )
+      const rawVerticals = stationBundles.flatMap((bundle) =>
+        bundle.verticals.map((vertical) => ({ ...vertical, ...stamp(vertical) }))
+      )
+      const rawSections = stationBundles.flatMap((bundle) =>
+        bundle.sections.map((section) => ({ ...section, ...stamp(section) }))
+      )
+      const { points: attributedPoints } = attributePoints(
+        rawPoints,
+        rawVerticals,
+        rawSections,
+        calibrationSeeds.map((line) => ({ ...line, ...stamp(line) }))
+      )
+      await db.points.bulkPut(attributedPoints)
       await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
 
       // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
@@ -375,7 +491,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.calibrations],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +499,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.calibrations.clear()
       ])
     }
   )
@@ -397,15 +514,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, calibrations] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.calibrations.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, calibrations }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */
@@ -460,7 +578,7 @@ export function writeLastStationId(id: string | null): void {
   }
 }
 
-/** 计算某垂线的平均流速（页面与播种共用同一套算法） */
+/** 计算某垂线的平均流速（页面与播种共用同一套算法）；挂起测点不参与 */
 export function verticalMeanVelocity(points: Point[]): number {
-  return calcMeanVelocity(points.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
+  return calcMeanVelocity(activePointRows(points))
 }

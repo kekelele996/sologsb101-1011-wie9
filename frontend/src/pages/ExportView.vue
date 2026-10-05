@@ -13,6 +13,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useCalibrationStore } from '@/stores/calibrationStore'
 import {
   DB_NAME,
   DB_VERSION,
@@ -37,6 +38,7 @@ import { fitPowerCurve } from '@/types/rating'
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const calibrationStore = useCalibrationStore()
 
 const counts = ref<Record<string, number>>({})
 const lastBackupAt = ref<string | null>(null)
@@ -156,6 +158,7 @@ async function refreshAll(): Promise<void> {
 }
 
 onMounted(() => {
+  calibrationStore.start()
   void refreshAll()
 })
 </script>
@@ -181,6 +184,15 @@ onMounted(() => {
       <StatBadge label="测站" :value="counts.stations ?? 0" suffix="站" icon="Odometer" />
       <StatBadge label="断面测次" :value="counts.sections ?? 0" suffix="次" icon="Files" tone="info" />
       <StatBadge label="流速测点" :value="counts.points ?? 0" suffix="点" icon="DataLine" tone="success" />
+      <StatBadge label="检定线" :value="counts.calibrations ?? 0" suffix="条" icon="Medal" />
+      <StatBadge
+        v-if="calibrationStore.suspendedCount > 0"
+        label="挂起测点"
+        :value="calibrationStore.suspendedCount"
+        suffix="点"
+        tone="warning"
+        icon="Warning"
+      />
       <StatBadge
         label="比测合格率"
         :value="ratingStore.fitQuality.qualifyRatePct"
@@ -290,7 +302,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / calibrations 七张表
         </span>
       </div>
 

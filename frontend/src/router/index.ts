@@ -38,6 +38,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '水位流量关系点据', icon: 'TrendCharts' }
   },
   {
+    path: '/calibrations',
+    name: 'calibration-list',
+    component: () => import('@/pages/CalibrationList.vue'),
+    meta: { title: '流速仪检定线', icon: 'Medal' }
+  },
+  {
     path: '/export',
     name: 'export-view',
     component: () => import('@/pages/ExportView.vue'),

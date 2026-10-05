@@ -2,9 +2,20 @@
  * 流量计算工具：垂线加权平均流速、部分面积法与断面流量计算。
  * 页面、store 与数据库播种共用同一套算法，保证展示值与存储值一致。
  */
+import type { Point } from '@/types/point'
 
 /** 默认计算权重：一点法 1.0、两点法 0.5/0.5、三点法 1/3、五点法 0.2 */
 export const DEFAULT_WEIGHTS: number[] = [1, 0.5, 1 / 3, 0.25, 0.2]
+
+/**
+ * 参与流量计算的测点行：挂起（suspended）测点不参与垂线平均流速与断面流量。
+ * 页面与 store 统一用它把 Point[] 喂给 calcMeanVelocity / calcSectionDischarge。
+ */
+export function activePointRows(points: Point[]): Array<{ velocityMs: number; weight: number }> {
+  return points
+    .filter((point) => point.status !== 'suspended')
+    .map((point) => ({ velocityMs: point.velocityMs, weight: point.weight }))
+}
 
 /** 保留小数位（避免浮点误差累积） */
 export function round(value: number, digits = 2): number {

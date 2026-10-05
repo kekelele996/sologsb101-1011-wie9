@@ -16,6 +16,11 @@ export interface Section {
   stageM: number
   /** 流速仪 / 浮标 / ADCP */
   method: MeasureMethod
+  /**
+   * 流速仪编号（如 LS25-1/08#）：仅流速仪法需要，测点按施测日生效的检定线换算；
+   * 浮标 / ADCP 法留空。
+   */
+  meterNo: string
   /** 测流时间 */
   measuredAt: string
   createdAt: number

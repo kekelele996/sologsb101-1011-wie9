@@ -16,6 +16,11 @@ export interface Section {
   stageM: number
   /** 流速仪 / 浮标 / ADCP */
   method: MeasureMethod
+  /**
+   * 使用的流速仪仪器编号（method 为流速仪时必填）：
+   * 测点按「仪器编号 + 施测日」匹配该仪器当天生效的检定线换算。
+   */
+  meterNo: string | null
   /** 测流时间 */
   measuredAt: string
   createdAt: number

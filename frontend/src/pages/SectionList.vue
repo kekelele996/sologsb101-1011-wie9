@@ -3,7 +3,7 @@
  * 模块 2：/stations/:id/sections 断面测次列表与测法标记
  * 新增测次后回显当前水位；深链访问时若测站不存在给出友好空态。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Edit, Plus, Right, Timer } from '@element-plus/icons-vue'
@@ -14,6 +14,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useMeterLineStore } from '@/stores/meterLineStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
 import { initDatabase } from '@/utils/db'
 
@@ -21,6 +22,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const meterStore = useMeterLineStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -33,6 +35,7 @@ const form = reactive({
   startDistanceM: 0,
   stageM: 0,
   method: '流速仪' as MeasureMethod,
+  meterNo: '',
   measuredAt: new Date().toISOString().slice(0, 16)
 })
 
@@ -52,6 +55,16 @@ const filterModel = computed<FilterModel>(() => ({
   methods: sectionStore.filter.methods,
   minStageM: sectionStore.filter.minStageM
 }))
+
+/** 可选流速仪编号（检定室台账中出现过的仪器） */
+const meterNoOptions = computed(() => Array.from(new Set(meterStore.meterLines.map((line) => line.meterNo))))
+
+/** 所选仪器在施测日是否有生效检定线 */
+const meterLineOnDate = computed(() =>
+  form.method === '流速仪' && form.meterNo
+    ? meterStore.lineForDay(new Date(form.measuredAt).toISOString(), form.meterNo)
+    : null
+)
 
 const stats = computed(() => {
   const list = sectionStore.sectionsOfStation(stationId.value)
@@ -81,6 +94,7 @@ function openCreate(): void {
   form.startDistanceM = stats.value.latest?.startDistanceM ?? 0
   form.stageM = stats.value.latest?.stageM ?? 0
   form.method = '流速仪'
+  form.meterNo = ''
   form.measuredAt = new Date().toISOString().slice(0, 16)
   dialogVisible.value = true
 }
@@ -91,6 +105,7 @@ function openEdit(section: Section): void {
   form.startDistanceM = section.startDistanceM
   form.stageM = section.stageM
   form.method = section.method
+  form.meterNo = section.meterNo ?? ''
   form.measuredAt = section.measuredAt.slice(0, 16)
   dialogVisible.value = true
 }
@@ -112,6 +127,10 @@ async function submitForm(): Promise<void> {
     ElMessage.warning('请选择测流时间')
     return
   }
+  if (form.method === '流速仪' && !form.meterNo.trim()) {
+    ElMessage.warning('流速仪测次请填写使用的流速仪仪器编号（测点按该仪器施测日生效检定线换算）')
+    return
+  }
   submitting.value = true
   try {
     const payload = {
@@ -120,6 +139,7 @@ async function submitForm(): Promise<void> {
       startDistanceM: form.startDistanceM,
       stageM: form.stageM,
       method: form.method,
+      meterNo: form.method === '流速仪' ? form.meterNo.trim() : null,
       measuredAt: new Date(form.measuredAt).toISOString()
     }
     if (editingId.value) {
@@ -175,6 +195,13 @@ function reseedIfEmpty(): void {
 }
 
 onMounted(() => {
+  meterStore.start()
+  sectionStore.setMeterLines(meterStore.meterLines)
+  watch(
+    () => meterStore.meterLines,
+    (lines) => sectionStore.setMeterLines(lines),
+    { immediate: true }
+  )
   reseedIfEmpty()
   const query = route.query
   sectionStore.patchFilter({
@@ -281,6 +308,11 @@ onMounted(() => {
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="流速仪编号" width="140">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.method === '流速仪' ? row.meterNo ?? '—' : '—' }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.stageM.toFixed(2) }}</span>
@@ -330,6 +362,24 @@ onMounted(() => {
           <el-radio-group v-model="form.method">
             <el-radio-button v-for="method in MEASURE_METHODS" :key="method" :value="method">{{ method }}</el-radio-button>
           </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="form.method === '流速仪'" label="流速仪编号" required>
+          <el-select
+            v-model="form.meterNo"
+            filterable
+            allow-create
+            default-first-option
+            placeholder="选择或输入仪器编号，如 LS20-250603"
+            style="width: 280px"
+          >
+            <el-option v-for="no in meterNoOptions" :key="no" :label="no" :value="no" />
+          </el-select>
+          <span v-if="form.meterNo && !meterLineOnDate" class="page__unit page__danger">
+            施测日该仪器无生效检定线，测点将列为未匹配
+          </span>
+          <span v-else-if="meterLineOnDate" class="page__unit">
+            施测日检定号 {{ meterLineOnDate.certNo }}（k={{ meterLineOnDate.factorK }}, c={{ meterLineOnDate.factorC }}）
+          </span>
         </el-form-item>
         <el-form-item label="水位" required>
           <el-input-number v-model="form.stageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" />
@@ -386,5 +436,9 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__danger {
+  color: #c0392b;
 }
 </style>

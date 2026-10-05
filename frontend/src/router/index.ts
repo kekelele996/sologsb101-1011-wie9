@@ -38,6 +38,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '水位流量关系点据', icon: 'TrendCharts' }
   },
   {
+    path: '/meter-lines',
+    name: 'meter-reconcile',
+    component: () => import('@/pages/MeterReconcile.vue'),
+    meta: { title: '流速仪检定线对账', icon: 'SetUp' }
+  },
+  {
     path: '/export',
     name: 'export-view',
     component: () => import('@/pages/ExportView.vue'),

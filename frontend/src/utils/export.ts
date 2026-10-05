@@ -13,7 +13,7 @@ import {
 } from '@/utils/db'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares', 'meterLines'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,13 +21,14 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, meterLines] = await Promise.all([
     db.stations.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
     db.ratings.toArray(),
-    db.compares.toArray()
+    db.compares.toArray(),
+    db.meterLines.toArray()
   ])
   return {
     app: 'gbhydrogaug',
@@ -38,7 +39,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    meterLines
   }
 }
 
@@ -52,7 +54,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== 'gbhydrogaug' && obj.app !== undefined) {
     errors.push('app 字段应为 gbhydrogaug，文件来源不明')
   }
-  for (const key of BACKUP_KEYS) {
+  // meterLines 为 v3 新增：v2 老备份没有该表，按空台账放行，导入后测点可再对账
+  const requiredKeys = BACKUP_KEYS.filter((key) => key !== 'meterLines')
+  for (const key of requiredKeys) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -65,7 +69,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    meterLines: Array.isArray(obj.meterLines) ? obj.meterLines : []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +83,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    meterLines: payload.meterLines.length
   }
 }
 
@@ -116,7 +122,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.meterLines],
     async () => {
       await db.stations.bulkPut(payload.stations)
       await db.sections.bulkPut(payload.sections)
@@ -124,6 +130,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.points.bulkPut(payload.points)
       await db.ratings.bulkPut(payload.ratings)
       await db.compares.bulkPut(payload.compares)
+      await db.meterLines.bulkPut(payload.meterLines)
     }
   )
   return countPayload(payload)
@@ -135,6 +142,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const sectionMap = new Map<string, string>()
   const verticalMap = new Map<string, string>()
   const ratingMap = new Map<string, string>()
+  const meterLineMap = new Map<string, string>()
 
   const stations = payload.stations.map((station) => {
     const id = createId('stn')
@@ -151,10 +159,17 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     verticalMap.set(vertical.id, id)
     return { ...vertical, id, sectionId: sectionMap.get(vertical.sectionId) ?? vertical.sectionId }
   })
+  const meterLines = payload.meterLines.map((line) => {
+    const id = createId('mtr')
+    meterLineMap.set(line.id, id)
+    return { ...line, id }
+  })
   const points = payload.points.map((point) => ({
     ...point,
     id: createId('pnt'),
-    verticalId: verticalMap.get(point.verticalId) ?? point.verticalId
+    verticalId: verticalMap.get(point.verticalId) ?? point.verticalId,
+    // 追加导入的检定线也已重分配 id，测点归属同步改写；对不上的留空由对账页单列
+    meterLineId: point.meterLineId ? meterLineMap.get(point.meterLineId) ?? null : null
   }))
   const ratings = payload.ratings.map((rating) => {
     const id = createId('rat')
@@ -166,7 +181,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  return { ...payload, stations, sections, verticals, points, ratings, compares, meterLines }
 }
 
 /**

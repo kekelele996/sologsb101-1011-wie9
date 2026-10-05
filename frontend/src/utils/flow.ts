@@ -135,10 +135,20 @@ export function unitDischarge(depthM: number, meanVelocityMs: number): number {
   return round(depthM * meanVelocityMs, 3)
 }
 
-/** 流速仪测点历时换算：转数 / 历时 → 流速（简化直线公式，供测点录入校验提示） */
-export function velocityFromRevolutions(revolutions: number, durationS: number, k = 0.25, c = 0.01): number {
+/**
+ * 流速仪检定公式换算测点流速：v = k·n/t + c
+ * n 为测速历时内总转数、t 为历时（s）、k/c 为检定线系数。
+ * 测点流速按施测日生效的检定线换算，检定室台账系数变更不改写历史记录。
+ */
+export function velocityByMeterLine(
+  revolutions: number,
+  durationS: number,
+  factorK: number,
+  factorC: number
+): number {
   if (!Number.isFinite(revolutions) || !Number.isFinite(durationS) || durationS <= 0) return 0
-  return round(k * (revolutions / durationS) + c, 3)
+  if (!Number.isFinite(factorK) || !Number.isFinite(factorC)) return 0
+  return round(factorK * (revolutions / durationS) + factorC, 3)
 }
 
 /** 水位流量关系幂函数值：Q = a × (H - H0)^b */

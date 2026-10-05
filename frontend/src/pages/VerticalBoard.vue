@@ -40,12 +40,14 @@ const form = reactive({
 const verticals = computed(() => sectionStore.verticalsOfSection(sectionId.value))
 const conflicts = computed(() => (section.value ? sectionStore.findDistanceConflicts(sectionId.value) : []))
 
-/** 每条垂线的平均流速（按测点权重加权）与单宽流量 */
+/** 每条垂线的平均流速（按测点权重加权；挂起 / 未匹配检定线的测点不参与）与单宽流量 */
 const verticalRows = computed(() =>
   verticals.value.map((vertical) => {
-    const points = sectionStore.pointsOfVertical(vertical.id)
+    const allPoints = sectionStore.pointsOfVertical(vertical.id)
+    const points = sectionStore.participatingPointsOfVertical(vertical.id)
+    const suspendedPoints = allPoints.length - points.length
     const meanVelocityMs = calcMeanVelocity(points.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
-    return { vertical, points, meanVelocityMs }
+    return { vertical, points, allPoints, suspendedPoints, meanVelocityMs }
   })
 )
 
@@ -64,7 +66,8 @@ const discharge = computed(() =>
 
 const stats = computed(() => ({
   verticalCount: verticals.value.length,
-  pointCount: verticalRows.value.reduce((sum, row) => sum + row.points.length, 0),
+  pointCount: verticalRows.value.reduce((sum, row) => sum + row.allPoints.length, 0),
+  suspendedCount: verticalRows.value.reduce((sum, row) => sum + row.suspendedPoints, 0),
   maxDepthM: verticals.value.length ? Math.max(...verticals.value.map((item) => item.depthM)) : 0,
   widthM: discharge.value.widthM
 }))
@@ -234,6 +237,14 @@ onMounted(() => {
         :title="`起点距排序校验未通过：垂线 ${conflicts.join('、')} 的起点距与其他垂线重复，请调整后再参与流量计算`"
       />
 
+      <el-alert
+        v-if="stats.suspendedCount > 0"
+        type="warning"
+        show-icon
+        :closable="false"
+        title="有测点因检定线换新 / 撤销已挂起或未匹配检定线，暂不参与断面平均流速与流量计算；请在「检定线对账」中按测次重算。"
+      />
+
       <EmptyPanel
         v-if="verticalRows.length === 0"
         title="该测次还没有垂线"
@@ -262,13 +273,17 @@ onMounted(() => {
         <el-table-column label="测点数" width="100" align="center">
           <template #default="{ row }">
             <el-button text type="primary" size="small" @click="gotoPoints(row.vertical)">
-              {{ row.points.length }} 点
+              {{ row.allPoints.length }} 点
             </el-button>
+            <el-tag v-if="row.suspendedPoints > 0" size="small" type="warning" effect="plain" class="page__suspend-tag">
+              {{ row.suspendedPoints }} 挂起
+            </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="平均流速 (m/s)" width="140" align="right">
+        <el-table-column label="平均流速 (m/s)" width="150" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.meanVelocityMs.toFixed(3) }}</span>
+            <span v-if="row.suspendedPoints > 0" class="gb-hint">（不含挂起）</span>
           </template>
         </el-table-column>
         <el-table-column label="单宽流量 (m²/s)" width="150" align="right">
@@ -385,5 +400,9 @@ onMounted(() => {
   margin-left: 4px;
   color: #d68910;
   vertical-align: middle;
+}
+
+.page__suspend-tag {
+  margin-top: 2px;
 }
 </style>

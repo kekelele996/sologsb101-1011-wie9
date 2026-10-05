@@ -3,12 +3,13 @@
  * 应用外壳：顶部导航（路由跳转 + 数据概览）、主内容区与页脚。
  * 导航项在层级路由下回落到父级列表，保证任意深链页面都能一键跳走。
  */
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { DataLine, Files, Histogram, Odometer, PieChart, SetUp, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useMeterLineStore } from '@/stores/meterLineStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,12 +17,21 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const meterStore = useMeterLineStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  meterStore.start()
 })
+
+// 检定室台账同步给巡测侧，测点换算与对账始终使用最新检定线快照
+watch(
+  () => meterStore.meterLines,
+  (lines) => sectionStore.setMeterLines(lines),
+  { immediate: true }
+)
 
 /** 层级路由统一归属到最上层导航项 */
 const activeKey = computed(() => {
@@ -31,8 +41,19 @@ const activeKey = computed(() => {
   return route.path
 })
 
+/** 挂起与未匹配测点合计（不参与断面流量），作为检定线对账入口的提醒角标 */
+const pendingPointCount = computed(() =>
+  sectionStore.points.filter((point) => point.linkStatus === '已挂起' || point.linkStatus === '未匹配').length
+)
+
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
+  {
+    key: '/meter-lines',
+    label: '检定线对账',
+    icon: SetUp,
+    badge: pendingPointCount.value > 0 ? String(pendingPointCount.value) : String(meterStore.meterLines.length)
+  },
   { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
@@ -115,7 +136,8 @@ function go(path: string): void {
       </span>
       <span>
         测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
-        {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
+        {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 检定线
+        {{ meterStore.meterLines.length }} · 点据
         {{ ratingStore.ratings.length }}
       </span>
     </footer>

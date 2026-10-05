@@ -13,20 +13,29 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useMeterLineStore } from '@/stores/meterLineStore'
 import { parsePointPaste } from '@/types/point'
-import type { Point } from '@/types/point'
-import { calcMeanVelocity, calcSectionDischarge, velocityFromRevolutions } from '@/utils/flow'
+import { isSuspendedStatus, type Point } from '@/types/point'
+import { calcMeanVelocity, calcSectionDischarge, velocityByMeterLine } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const meterStore = useMeterLineStore()
 
 const verticalId = computed(() => String(route.params.id ?? ''))
 const vertical = computed(() => sectionStore.verticals.find((item) => item.id === verticalId.value) ?? null)
 const section = computed(() => (vertical.value ? sectionStore.sectionById(vertical.value.sectionId) : null))
 const station = computed(() => (section.value ? stationStore.stationById(section.value.stationId) : null))
+
+/** 本测次是否流速仪法：流速仪测点记转数 / 历时，流速按施测日生效检定线换算 */
+const isMeterMethod = computed(() => section.value?.method === '流速仪')
+/** 施测日应对账的检定线（新增测点默认归属） */
+const expectedLine = computed(() =>
+  section.value ? meterStore.lineForDay(section.value.measuredAt, section.value.meterNo) : null
+)
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -35,7 +44,8 @@ const form = reactive({
   relativeDepth: 0.6,
   velocityMs: 0.5,
   weight: 1,
-  durationS: 100
+  durationS: 100,
+  revolutions: null as number | null
 })
 
 const pasteVisible = ref(false)
@@ -45,15 +55,19 @@ const pasteErrors = ref<string[]>([])
 const bulkVelocity = ref<number | null>(null)
 
 const points = computed(() => sectionStore.pointsOfVertical(verticalId.value))
+/** 挂起 / 未匹配测点不参与垂线平均流速与断面流量 */
+const activePoints = computed(() => sectionStore.participatingPointsOfVertical(verticalId.value))
+const suspendedCount = computed(() => points.value.filter((point) => isSuspendedStatus(point.linkStatus)).length)
+
 const meanVelocityMs = computed(() =>
-  calcMeanVelocity(points.value.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
+  calcMeanVelocity(activePoints.value.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
 )
 
-/** 该垂线所在断面的流量成果（用于对比本垂线贡献） */
+/** 该垂线所在断面的流量成果（用于对比本垂线贡献；挂起测点所在垂线不参与） */
 const discharge = computed(() => {
   if (!section.value) return null
   const rows = sectionStore.verticalsOfSection(section.value.id).map((item) => {
-    const itemPoints = sectionStore.pointsOfVertical(item.id)
+    const itemPoints = sectionStore.participatingPointsOfVertical(item.id)
     return {
       id: item.id,
       no: item.no,
@@ -72,17 +86,37 @@ const verticalPartialFlow = computed(() => {
   return slice ? slice.partialFlow : 0
 })
 
-/** 流速分布图坐标：相对水深为纵轴、流速为横轴 */
+/** 垂线流速分布图坐标：相对水深为纵轴、流速为横轴；挂起测点置灰 */
 const chartPoints = computed(() => {
   const maxVelocity = Math.max(0.1, ...points.value.map((point) => point.velocityMs))
   const width = 320
   const height = 200
   return points.value.map((point) => ({
     ...point,
+    suspended: isSuspendedStatus(point.linkStatus),
     cx: 40 + (point.velocityMs / maxVelocity) * (width - 60),
     cy: 20 + point.relativeDepth * (height - 50)
   }))
 })
+
+/** 测点归属检定线的检定号展示 */
+function lineLabel(point: Point): string {
+  if (point.linkStatus === '非流速仪') return '非流速仪'
+  if (!point.meterLineId) return '未匹配'
+  const line = meterStore.lineById(point.meterLineId)
+  return line ? line.certNo : '检定线缺失'
+}
+
+const statusTagType = (status: string | null): 'success' | 'warning' | 'danger' | 'info' => {
+  if (status === '已换算') return 'success'
+  if (status === '已挂起') return 'warning'
+  if (status === '未匹配') return 'danger'
+  return 'info'
+}
+
+function pointRowClass({ row }: { row: Point }): string {
+  return isSuspendedStatus(row.linkStatus) ? 'row-suspended' : ''
+}
 
 function openCreate(): void {
   editingId.value = null
@@ -92,6 +126,7 @@ function openCreate(): void {
   form.velocityMs = points.value.length > 0 ? points.value[0].velocityMs : 0.5
   form.weight = Number((1 / Math.max(1, points.value.length + 1)).toFixed(4))
   form.durationS = 100
+  form.revolutions = null
   dialogVisible.value = true
 }
 
@@ -101,6 +136,7 @@ function openEdit(point: Point): void {
   form.velocityMs = point.velocityMs
   form.weight = point.weight
   form.durationS = point.durationS
+  form.revolutions = point.revolutions
   dialogVisible.value = true
 }
 
@@ -109,21 +145,59 @@ async function submitForm(): Promise<void> {
     ElMessage.warning('相对水深应在 0 ~ 1 之间（0 为水面、1 为河底）')
     return
   }
-  if (!Number.isFinite(form.velocityMs) || form.velocityMs < 0 || form.velocityMs > 12) {
-    ElMessage.warning('流速应在 0 ~ 12 m/s 之间')
-    return
-  }
   if (!Number.isFinite(form.durationS) || form.durationS <= 0) {
     ElMessage.warning('测速历时应为正数（s）')
     return
   }
+  if (isMeterMethod.value) {
+    if (form.revolutions === null || !Number.isFinite(form.revolutions) || form.revolutions < 0) {
+      ElMessage.warning('流速仪测点请填写转数，流速由施测日生效检定线换算')
+      return
+    }
+  } else if (!Number.isFinite(form.velocityMs) || form.velocityMs < 0 || form.velocityMs > 12) {
+    ElMessage.warning('流速应在 0 ~ 12 m/s 之间')
+    return
+  }
   submitting.value = true
   try {
-    if (editingId.value) {
-      await sectionStore.updatePoint(editingId.value, { ...form })
+    if (isMeterMethod.value) {
+      // 归属检定线与对账状态交给 store 按施测日解析；对不上的单列「未匹配」
+      const payload = {
+        relativeDepth: form.relativeDepth,
+        weight: form.weight,
+        durationS: form.durationS,
+        revolutions: form.revolutions,
+        meterLineId: null,
+        linkStatus: null,
+        velocityMs: expectedLine.value
+          ? velocityByMeterLine(form.revolutions ?? 0, form.durationS, expectedLine.value.factorK, expectedLine.value.factorC)
+          : form.velocityMs
+      }
+      if (editingId.value) {
+        await sectionStore.updatePoint(editingId.value, payload)
+        ElMessage.success('测点已更新并按检定线重算')
+      } else {
+        const created = await sectionStore.createPoint(verticalId.value, payload)
+        ElMessage.success(created.linkStatus === '已换算' ? '测点已新增并换算' : `测点已新增（${created.linkStatus}，不参与断面流量）`)
+      }
+    } else if (editingId.value) {
+      await sectionStore.updatePoint(editingId.value, {
+        relativeDepth: form.relativeDepth,
+        velocityMs: form.velocityMs,
+        weight: form.weight,
+        durationS: form.durationS
+      })
       ElMessage.success('测点已更新')
     } else {
-      await sectionStore.createPoint(verticalId.value, { ...form })
+      await sectionStore.createPoint(verticalId.value, {
+        relativeDepth: form.relativeDepth,
+        velocityMs: form.velocityMs,
+        weight: form.weight,
+        durationS: form.durationS,
+        revolutions: null,
+        meterLineId: null,
+        linkStatus: '非流速仪'
+      })
       ElMessage.success('测点已新增')
     }
     dialogVisible.value = false
@@ -187,6 +261,10 @@ async function applyBulkVelocity(): Promise<void> {
     ElMessage.warning('请填写要批量写入的流速值')
     return
   }
+  if (isMeterMethod.value) {
+    ElMessage.warning('流速仪测点的流速由转数按检定线换算，不能直接批量改写；请用批量粘贴补转数后按测次重算')
+    return
+  }
   try {
     await ElMessageBox.confirm(
       `将该垂线全部 ${points.value.length} 个测点的流速统一改写为 ${bulkVelocity.value} m/s？`,
@@ -205,12 +283,28 @@ async function doNormalize(): Promise<void> {
   ElMessage.success(`已按 ${count} 个测点平均分配计算权重`)
 }
 
-/** 由转数推算流速（流速仪公式），填回表单 */
+/** 由转数按施测日生效检定线推算流速（v = k·n/t + c），填入表单 */
 function fillByRevolutions(): void {
+  if (!isMeterMethod.value) {
+    ElMessage.info('当前测次不是流速仪法，流速直接录入即可')
+    return
+  }
+  if (!expectedLine.value) {
+    ElMessage.warning('施测日没有生效检定线，请先到检定线对账台登记或改挂检定线')
+    return
+  }
   const revolutions = Number(window.prompt('请输入测速历时内的转数（转）：', '120'))
   if (!Number.isFinite(revolutions) || revolutions <= 0) return
-  form.velocityMs = velocityFromRevolutions(revolutions, form.durationS)
-  ElMessage.success(`按转数 ${revolutions}、历时 ${form.durationS}s 推算流速 ${form.velocityMs} m/s`)
+  form.revolutions = revolutions
+  form.velocityMs = velocityByMeterLine(
+    revolutions,
+    form.durationS,
+    expectedLine.value.factorK,
+    expectedLine.value.factorC
+  )
+  ElMessage.success(
+    `按检定号 ${expectedLine.value.certNo}（k=${expectedLine.value.factorK}, c=${expectedLine.value.factorC}）换算流速 ${form.velocityMs} m/s`
+  )
 }
 
 onMounted(() => {
@@ -261,6 +355,11 @@ onMounted(() => {
           <p class="gb-hint">
             逐点录入相对水深与流速，权重参与加权平均；同一垂线的平均流速乘以部分面积得到部分流量，最终汇总为断面流量。
           </p>
+          <p v-if="isMeterMethod" class="gb-hint page__meter-line">
+            流速仪测次：测点记转数与历时，流速按施测日 {{ section?.measuredAt.slice(0, 10) }} 生效检定线
+            <strong>{{ expectedLine ? `${expectedLine.certNo}（k=${expectedLine.factorK}, c=${expectedLine.factorC}）` : '（无生效检定线，新增测点将列为未匹配）' }}</strong>
+            换算；同一测次的测点必须在同一条线上。
+          </p>
         </div>
         <div class="page__actions">
           <el-button :icon="MagicStick" @click="doNormalize">权重归一</el-button>
@@ -269,8 +368,23 @@ onMounted(() => {
         </div>
       </div>
 
+      <el-alert
+        v-if="suspendedCount > 0"
+        type="warning"
+        show-icon
+        :closable="false"
+        :title="`本垂线有 ${suspendedCount} 个测点已挂起 / 未匹配检定线，暂不参与断面流量；请到检定线对账台按测次重算或逐点改挂检定线。`"
+      />
+
       <div class="gb-stats-row">
         <StatBadge label="测点数" :value="points.length" suffix="点" icon="DataLine" />
+        <StatBadge
+          label="参与计算"
+          :value="activePoints.length"
+          suffix="点"
+          :tone="suspendedCount > 0 ? 'warning' : 'success'"
+          icon="CircleCheck"
+        />
         <StatBadge label="垂线平均流速" :value="meanVelocityMs.toFixed(3)" suffix="m/s" tone="success" icon="TrendCharts" />
         <StatBadge label="部分流量" :value="verticalPartialFlow.toFixed(3)" suffix="m³/s" tone="info" icon="Histogram" />
         <StatBadge
@@ -306,28 +420,41 @@ onMounted(() => {
       />
 
       <div v-else class="page__grid">
-        <el-table :data="points" border stripe class="gb-table-compact">
-          <el-table-column label="相对水深" width="110" align="right">
+        <el-table :data="points" border stripe class="gb-table-compact" :row-class-name="pointRowClass">
+          <el-table-column label="相对水深" width="100" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.relativeDepth.toFixed(2) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="测点流速 (m/s)" width="140" align="right">
+          <el-table-column v-if="isMeterMethod" label="转数" width="90" align="right">
+            <template #default="{ row }">
+              <span class="gb-mono">{{ row.revolutions ?? '—' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="测点流速 (m/s)" width="130" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.velocityMs.toFixed(3) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="计算权重" width="110" align="right">
+          <el-table-column v-if="isMeterMethod" label="检定线" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">{{ lineLabel(row) }}</template>
+          </el-table-column>
+          <el-table-column v-if="isMeterMethod" label="对账" width="92" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" :type="statusTagType(row.linkStatus)" effect="plain">{{ row.linkStatus ?? '待对账' }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="计算权重" width="100" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.weight.toFixed(4) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="测速历时 (s)" width="120" align="right">
+          <el-table-column label="测速历时 (s)" width="110" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.durationS }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="加权贡献" align="right" min-width="120">
+          <el-table-column label="加权贡献" align="right" min-width="110">
             <template #default="{ row }">
               <span class="gb-mono">{{ (row.velocityMs * row.weight).toFixed(4) }}</span>
             </template>
@@ -363,8 +490,8 @@ onMounted(() => {
               :cx="point.cx"
               :cy="point.cy"
               r="4"
-              fill="#7fd1e8"
-              stroke="#0f4c75"
+              :fill="point.suspended ? '#e8b9b0' : '#7fd1e8'"
+              :stroke="point.suspended ? '#c0392b' : '#0f4c75'"
             />
           </svg>
         </el-card>
@@ -377,16 +504,43 @@ onMounted(() => {
           <el-slider v-model="form.relativeDepth" :min="0" :max="1" :step="0.05" show-input />
           <span class="page__unit">0 水面 · 1 河底</span>
         </el-form-item>
-        <el-form-item label="测点流速" required>
-          <el-input-number v-model="form.velocityMs" :min="0" :max="12" :step="0.01" :precision="3" controls-position="right" />
-          <span class="page__unit">m/s</span>
-        </el-form-item>
+        <template v-if="isMeterMethod">
+          <el-form-item label="转数" required>
+            <el-input-number v-model="form.revolutions" :min="0" :max="100000" :step="1" :precision="1" controls-position="right" />
+            <span class="page__unit">转（历时内）</span>
+          </el-form-item>
+          <el-form-item label="测速历时" required>
+            <el-input-number v-model="form.durationS" :min="1" :max="3600" controls-position="right" />
+            <span class="page__unit">s</span>
+          </el-form-item>
+          <el-form-item label="换算流速">
+            <el-input-number
+              :model-value="
+                expectedLine && form.revolutions !== null
+                  ? velocityByMeterLine(form.revolutions, form.durationS, expectedLine.factorK, expectedLine.factorC)
+                  : form.velocityMs
+              "
+              disabled
+              :precision="3"
+              controls-position="right"
+            />
+            <span class="page__unit">
+              m/s · {{ expectedLine ? `检定号 ${expectedLine.certNo}` : '施测日无生效检定线，将列为未匹配' }}
+            </span>
+          </el-form-item>
+        </template>
+        <template v-else>
+          <el-form-item label="测点流速" required>
+            <el-input-number v-model="form.velocityMs" :min="0" :max="12" :step="0.01" :precision="3" controls-position="right" />
+            <span class="page__unit">m/s</span>
+          </el-form-item>
+          <el-form-item label="测速历时" required>
+            <el-input-number v-model="form.durationS" :min="1" :max="3600" controls-position="right" />
+            <span class="page__unit">s</span>
+          </el-form-item>
+        </template>
         <el-form-item label="计算权重" required>
           <el-input-number v-model="form.weight" :min="0" :max="1" :step="0.01" :precision="4" controls-position="right" />
-        </el-form-item>
-        <el-form-item label="测速历时" required>
-          <el-input-number v-model="form.durationS" :min="1" :max="3600" controls-position="right" />
-          <span class="page__unit">s</span>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -399,9 +553,9 @@ onMounted(() => {
 
     <el-dialog v-model="pasteVisible" title="批量粘贴导入测点" width="620px">
       <p class="gb-hint">
-        每行一条，格式「相对水深,流速[,历时]」，逗号 / 空格 / 制表符均可。示例：<br />
+        每行一条，格式「相对水深,流速[,历时[,转数]]」，逗号 / 空格 / 制表符均可。流速仪测次可把流速填 - 并给转数，由施测日生效检定线换算。示例：<br />
         <span class="gb-mono">0.2,1.42,100</span><br />
-        <span class="gb-mono">0.6 1.18 100</span><br />
+        <span class="gb-mono">0.6 - 100 463</span><br />
         <span class="gb-mono">0.8,0.96</span>
       </p>
       <el-input v-model="pasteText" type="textarea" :rows="8" placeholder="0.2,1.42,100" />
@@ -488,6 +642,15 @@ onMounted(() => {
   margin-top: 10px;
   max-height: 160px;
   overflow: auto;
+}
+
+.page__meter-line {
+  margin-top: 6px;
+}
+
+:deep(.row-suspended) {
+  background: #fdf3ec !important;
+  color: #9a6a4f;
 }
 
 @media (max-width: 1080px) {
